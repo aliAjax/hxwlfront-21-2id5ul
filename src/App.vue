@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, reactive, ref } from "vue";
+import { computed, reactive, ref, watch } from "vue";
 
 type Field = {
   key: string;
@@ -14,6 +14,34 @@ type RecordItem = {
   notes: string;
   createdAt: string;
   [key: string]: string | number;
+};
+
+type DraftStation = {
+  id: string;
+  name: string;
+  snapshot: string;
+};
+
+type BatchDraft = {
+  stations: DraftStation[];
+  targetStatus: string;
+  reason: string;
+  stagedAt: string;
+};
+
+type BatchHistoryEntry = {
+  id: string;
+  reason: string;
+  targetStatus: string;
+  publishedAt: string;
+  changes: { id: string; name: string; before: string; after: string }[];
+  withdrawn: boolean;
+  withdrawnAt?: string;
+};
+
+type Notice = {
+  type: "success" | "error" | "info";
+  text: string;
 };
 
 const project = {
@@ -31,6 +59,9 @@ const project = {
     "Leaflet"
   ],
   "storageKey": "hxwlfront-21-station-map",
+  "draftKey": "hxwlfront-21-batch-draft",
+  "historyKey": "hxwlfront-21-batch-history",
+  "filterKey": "hxwlfront-21-filter",
   "formTitle": "新增油站",
   "primaryAction": "保存油站",
   "entityLabel": "油站",
@@ -118,10 +149,46 @@ function loadRecords(): RecordItem[] {
   }
 }
 
+function loadDraft(): BatchDraft | null {
+  const raw = localStorage.getItem(project.draftKey);
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as BatchDraft;
+    if (!Array.isArray(parsed.stations) || typeof parsed.targetStatus !== "string" || typeof parsed.reason !== "string") {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function loadHistory(): BatchHistoryEntry[] {
+  const raw = localStorage.getItem(project.historyKey);
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw) as BatchHistoryEntry[];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function loadFilter(): string {
+  const saved = localStorage.getItem(project.filterKey);
+  return saved && project.filters.includes(saved as (typeof project.filters)[number]) ? saved : project.filters[0];
+}
+
 const records = ref<RecordItem[]>(loadRecords());
 const form = reactive<Record<string, string | number>>(createBlank());
 const note = ref("");
-const filter = ref(project.filters[0]);
+const filter = ref(loadFilter());
+const draft = ref<BatchDraft | null>(loadDraft());
+const history = ref<BatchHistoryEntry[]>(loadHistory());
+const selectedIds = ref<string[]>([]);
+const targetStatus = ref<string>(draft.value?.targetStatus ?? "");
+const reason = ref<string>(draft.value?.reason ?? "");
+const notice = ref<Notice | null>(null);
 
 const filteredRecords = computed(() => {
   if (filter.value.startsWith("全部")) return records.value;
@@ -148,6 +215,43 @@ const maxChart = computed(() => Math.max(1, ...chartRows.value.map((row) => row.
 
 function persist() {
   localStorage.setItem(project.storageKey, JSON.stringify(records.value));
+  localStorage.setItem(project.draftKey, draft.value ? JSON.stringify(draft.value) : "");
+  localStorage.setItem(project.historyKey, JSON.stringify(history.value));
+}
+
+watch(filter, (value) => {
+  localStorage.setItem(project.filterKey, value);
+});
+
+const draftIdSet = computed(() => new Set((draft.value?.stations ?? []).map((station) => station.id)));
+
+const visibleChecked = computed({
+  get: () => filteredRecords.value.length > 0 && filteredRecords.value.every((record) => selectedIds.value.includes(record.id)),
+  set: (checked: boolean) => {
+    const visibleIds = filteredRecords.value.map((record) => record.id);
+    if (checked) {
+      selectedIds.value = [...new Set([...selectedIds.value, ...visibleIds])];
+    } else {
+      const visibleSet = new Set(visibleIds);
+      selectedIds.value = selectedIds.value.filter((id) => !visibleSet.has(id));
+    }
+  }
+});
+
+const visibleIndeterminate = computed(
+  () => !visibleChecked.value && filteredRecords.value.some((record) => selectedIds.value.includes(record.id))
+);
+
+function isSelected(id: string) {
+  return selectedIds.value.includes(id);
+}
+
+function toggleSelected(id: string) {
+  if (isSelected(id)) {
+    selectedIds.value = selectedIds.value.filter((item) => item !== id);
+  } else {
+    selectedIds.value = [...selectedIds.value, id];
+  }
 }
 
 function nextStatus(status: string) {
@@ -159,6 +263,17 @@ function primaryText(record: RecordItem) {
   const first = fields[0];
   const second = fields[1];
   return [record[first.key], record[second.key]].filter(Boolean).join(" / ") || project.entityLabel;
+}
+
+function formatTime(iso: string) {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return iso;
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function shortId(id: string) {
+  return id.slice(0, 8);
 }
 
 function submit() {
@@ -184,7 +299,143 @@ function flow(record: RecordItem) {
 
 function remove(id: string) {
   records.value = records.value.filter((record) => record.id !== id);
+  selectedIds.value = selectedIds.value.filter((item) => item !== id);
   persist();
+}
+
+function stageBatch() {
+  if (!targetStatus.value) {
+    notice.value = { type: "error", text: "请选择要统一发布的目标状态。" };
+    return;
+  }
+  if (!reason.value.trim()) {
+    notice.value = { type: "error", text: "请填写统一原因后再暂存。" };
+    return;
+  }
+  if (selectedIds.value.length === 0) {
+    notice.value = { type: "error", text: "请先勾选需要批量发布的站点。" };
+    return;
+  }
+  const stations: DraftStation[] = selectedIds.value.map((id) => {
+    const record = records.value.find((item) => item.id === id);
+    return {
+      id,
+      name: record ? primaryText(record) : id,
+      snapshot: record?.status ?? ""
+    };
+  });
+  draft.value = {
+    stations,
+    targetStatus: targetStatus.value,
+    reason: reason.value.trim(),
+    stagedAt: new Date().toISOString()
+  };
+  selectedIds.value = [];
+  persist();
+  notice.value = {
+    type: "success",
+    text: `已暂存 ${stations.length} 个站点（目标：${targetStatus.value}），刷新页面后仍保留，可直接提交或放弃。`
+  };
+}
+
+function submitDraft() {
+  if (!draft.value) return;
+  const current = draft.value;
+  const conflicts = current.stations.filter((station) => {
+    const record = records.value.find((item) => item.id === station.id);
+    return !record || record.status !== station.snapshot;
+  });
+  if (conflicts.length > 0) {
+    notice.value = {
+      type: "error",
+      text: `整批拒绝：${conflicts.map((station) => station.name).join("、")} 的当前状态已偏离暂存前快照，本次未发布任何站点。请重新勾选暂存后再提交。`
+    };
+    return;
+  }
+  const changedAt = new Date().toISOString();
+  const changes = current.stations.map((station) => ({
+    id: station.id,
+    name: station.name,
+    before: station.snapshot,
+    after: current.targetStatus
+  }));
+  records.value = records.value.map((record) =>
+    draftIdSet.value.has(record.id) ? { ...record, status: current.targetStatus } : record
+  );
+  history.value = [
+    {
+      id: crypto.randomUUID(),
+      reason: current.reason,
+      targetStatus: current.targetStatus,
+      publishedAt: changedAt,
+      changes,
+      withdrawn: false
+    },
+    ...history.value
+  ];
+  draft.value = null;
+  targetStatus.value = "";
+  reason.value = "";
+  selectedIds.value = [];
+  persist();
+  notice.value = {
+    type: "success",
+    text: `批量发布成功，共更新 ${changes.length} 个站点为「${current.targetStatus}」，前后状态已记入历史，可在历史中撤回整批。`
+  };
+}
+
+function discardDraft() {
+  draft.value = null;
+  targetStatus.value = "";
+  reason.value = "";
+  selectedIds.value = [];
+  persist();
+  notice.value = { type: "info", text: "已放弃暂存的批量发布，站点状态未做任何修改。" };
+}
+
+function withdrawBatch(entry: BatchHistoryEntry) {
+  if (entry.withdrawn) return;
+  const current = records.value;
+  const conflictReasons: string[] = [];
+  const deleted: string[] = [];
+  for (const change of entry.changes) {
+    const later = history.value.find(
+      (item) =>
+        !item.withdrawn &&
+        item.publishedAt > entry.publishedAt &&
+        item.changes.some((stationChange) => stationChange.id === change.id)
+    );
+    if (later) {
+      conflictReasons.push(`${change.name} 已被后续批次「${later.reason}」改动`);
+      continue;
+    }
+    const record = current.find((item) => item.id === change.id);
+    if (!record) {
+      deleted.push(change.name);
+    } else if (record.status !== change.after) {
+      conflictReasons.push(`${change.name} 当前状态为「${record.status}」，已偏离发布后状态「${change.after}」`);
+    }
+  }
+  if (conflictReasons.length > 0) {
+    notice.value = {
+      type: "error",
+      text: `拒绝恢复：${conflictReasons.join("；")}。该批次未执行任何恢复。`
+    };
+    return;
+  }
+  const idSet = new Set(entry.changes.map((change) => change.id));
+  records.value = records.value.map((record) => {
+    const change = entry.changes.find((item) => item.id === record.id);
+    return change && idSet.has(record.id) ? { ...record, status: change.before } : record;
+  });
+  entry.withdrawn = true;
+  entry.withdrawnAt = new Date().toISOString();
+  persist();
+  notice.value = {
+    type: "success",
+    text: `已撤回批次「${entry.reason}」，${entry.changes.length - deleted.length} 个站点恢复为发布前状态。`
+      + (deleted.length ? `（${deleted.join("、")} 已删除，未恢复）` : "")
+  };
 }
 </script>
 
@@ -237,11 +488,71 @@ function remove(id: string) {
             </select>
           </div>
 
+          <section class="batch-panel">
+            <h3>批量状态发布</h3>
+            <p v-if="notice" class="notice" :class="notice.type">{{ notice.text }}</p>
+            <template v-if="draft">
+              <p class="draft-info">
+                暂存于 {{ formatTime(draft.stagedAt) }}：共 {{ draft.stations.length }} 个站点，
+                目标「{{ draft.targetStatus }}」，原因：{{ draft.reason }}
+              </p>
+              <ul class="draft-stations">
+                <li v-for="station in draft.stations" :key="station.id">
+                  {{ station.name }}：{{ station.snapshot }} → {{ draft.targetStatus }}
+                </li>
+              </ul>
+              <div class="actions">
+                <button type="button" @click="submitDraft">检查快照并提交发布</button>
+                <button class="secondary" type="button" @click="discardDraft">放弃暂存</button>
+              </div>
+            </template>
+            <template v-else>
+              <div class="batch-row">
+                <label class="check-cell">
+                  <input
+                    type="checkbox"
+                    class="check-box"
+                    :checked="visibleChecked"
+                    :indeterminate.prop="visibleIndeterminate"
+                    @change="visibleChecked = ($event.target as HTMLInputElement).checked"
+                  />
+                  <span>全选当前筛选</span>
+                </label>
+                <label>
+                  目标状态
+                  <select v-model="targetStatus">
+                    <option value="">请选择</option>
+                    <option v-for="item in statuses" :key="item">{{ item }}</option>
+                  </select>
+                </label>
+                <label class="reason-cell">
+                  统一原因
+                  <input v-model="reason" placeholder="如：片区检修，统一暂停营业" />
+                </label>
+              </div>
+              <div class="actions">
+                <button type="button" @click="stageBatch">暂存勾选站点（{{ selectedIds.length }}）</button>
+              </div>
+            </template>
+          </section>
+
           <div class="record-grid">
             <div v-if="filteredRecords.length === 0" class="empty">暂无匹配数据</div>
             <article v-for="record in filteredRecords" :key="record.id" class="record">
               <div class="record-head">
-                <p class="record-title">{{ primaryText(record) }}</p>
+                <p class="record-title">
+                  <label class="check-cell">
+                    <input
+                      type="checkbox"
+                      class="check-box"
+                      :checked="isSelected(record.id)"
+                      :disabled="!!draft"
+                      @change="toggleSelected(record.id)"
+                    />
+                    <span>{{ primaryText(record) }}</span>
+                  </label>
+                  <span v-if="draftIdSet.has(record.id)" class="staged-flag">已暂存</span>
+                </p>
                 <span class="status">{{ record.status }}</span>
               </div>
               <div class="details">
@@ -255,6 +566,32 @@ function remove(id: string) {
               </div>
             </article>
           </div>
+
+          <section v-if="history.length" class="history">
+            <h3>批量发布历史</h3>
+            <div v-for="entry in history" :key="entry.id" class="history-item" :class="{ withdrawn: entry.withdrawn }">
+              <div class="history-head">
+                <div>
+                  <strong>批次 #{{ shortId(entry.id) }}</strong>
+                  <span class="history-meta">{{ formatTime(entry.publishedAt) }} · {{ entry.reason }} · {{ entry.changes.length }} 站 → {{ entry.targetStatus }}</span>
+                </div>
+                <button
+                  v-if="!entry.withdrawn"
+                  class="secondary"
+                  type="button"
+                  @click="withdrawBatch(entry)"
+                >撤回整批</button>
+                <span v-else class="withdrawn-flag">
+                  已撤回<span v-if="entry.withdrawnAt"> · {{ formatTime(entry.withdrawnAt) }}</span>
+                </span>
+              </div>
+              <p class="history-changes">
+                <template v-for="(change, index) in entry.changes" :key="change.id">
+                  {{ change.name }}：{{ change.before }} → {{ change.after }}<template v-if="index < entry.changes.length - 1">；</template>
+                </template>
+              </p>
+            </div>
+          </section>
 
           <div class="mini-chart">
             <div v-for="row in chartRows" :key="row.status" class="bar">
